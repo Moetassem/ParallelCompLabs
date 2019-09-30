@@ -11,7 +11,7 @@ using namespace std;
 
 constexpr auto matSize = 16;
 
-cudaError_t imageRectificationWithCuda();
+cudaError_t imageRectificationWithCuda(string& inputImg, string& outImg, int& numOfThreads);
 
 __global__ void imgRectificationKernel(int* matrix)
 {
@@ -21,19 +21,38 @@ __global__ void imgRectificationKernel(int* matrix)
 	}
 }
 
-int main()
+int main(int argc, char* argv[])
 {
-	cudaError_t status = imageRectificationWithCuda();
+	string inputImgName = "";
+	string outImgName = "";
+	int numOfThreads = 0;
+
+	if (argc != 4 || argv[1] == NULL || argv[2] == NULL || argv[3] == NULL ||
+		argv[1] == "-h" || argv[1] == "--help" || argv[1] == "--h") {
+		cout << "Assignment1.exe <name of input png> <name of output png> < # threads>" << endl;
+	}
+	else {
+		if (argv[1] != NULL) {
+			inputImgName = argv[1];
+		}
+		if (argv[2] != NULL) {
+			outImgName = argv[2];
+		}
+		if (argv[3] != NULL) {
+			numOfThreads = stoi(argv[3]);
+		}
+	}
+
+	std::cout << "Name of Input Image File: " << inputImgName << std::endl;
+	std::cout << "Name of Output Image File: " << outImgName << std::endl;
+	std::cout << "Name of Output Image File: " << numOfThreads << std::endl;
+
+	cudaError_t status = imageRectificationWithCuda(inputImgName, outImgName, numOfThreads);
 	return 0;
 }
 
-cudaError_t imageRectificationWithCuda()
+cudaError_t imageRectificationWithCuda(string &inputImg, string &outImg, int &threads)
 {
-	string fName = "";
-	std::cout << "Name of file: ";
-	std::cin >> fName;
-	std::cout << "File: " << fName << std::endl;
-
 	int sizeOfMat = 16;
 	int matrix[4][4] = { {126, 128, 122, 100}, {129, 120, 350, 300}, {122, 135, 127, 129}, {140, 145, 190, 195} };
 
