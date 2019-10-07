@@ -1,6 +1,7 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "lodepng.h"
+#include "gputimer.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -12,18 +13,16 @@
 using namespace std;
 using namespace lodepng;
 
-//constexpr auto matSize = 16;
+constexpr auto MAX_NUMBER_THREADS = 1024;
 
 cudaError_t imageRectificationWithCuda(int numOfThreads, char* inputImageName, char* outputImageName);
 
 cudaError_t imagePoolingWithCuda(int numOfThreads, char* inputImageName, char* outputImageName);
 
-void max(unsigned char a, unsigned char b, unsigned char c, unsigned char d, unsigned char o);
-
 __global__ void imgRectificationKernel(unsigned char* inMatrix, int size, int numOfThreads)
 {
 	for (int i = 0; i < size / numOfThreads; i++) {
-		int	k = numOfThreads*i+threadIdx.x;
+		int	k = (numOfThreads * i + threadIdx.x) + (blockIdx.x * numOfThreads);
 		if (inMatrix[k] < 127) {
 			inMatrix[k] = 127;
 		}
@@ -33,71 +32,53 @@ __global__ void imgRectificationKernel(unsigned char* inMatrix, int size, int nu
 	}
 }
 
-__global__ void imgPoolingKernel(unsigned char* rArray, unsigned char* gArray, unsigned char* bArray, unsigned char* aArray, unsigned char* outRArray, unsigned char* outGArray, unsigned char* outBArray, unsigned char* outAArray, unsigned char* outArray, int size, int numOfThreads, int width)
+__global__ void arrayMaxPerQuarterPixelKernel(unsigned char* inArray, unsigned char* outArray, int sizeofQuarterPixels, int numOfThreads, int width)
 {
-	for (int i = 0; i < size/4 ; i = i+2) {
-		
-		
-		int	k = numOfThreads * i + threadIdx.x;
-		if (k != 0 && k % width == 0) {
-			k = k + width;
-		}
+	for (int i = 0; i < ((sizeofQuarterPixels / 4) / numOfThreads); i++) {
+		int j = (threadIdx.x + numOfThreads * i) + (blockIdx.x * numOfThreads);
+		int k = 2 * j + width * (j / (width / 2));
 
-		// Pooling R channel
-		if (rArray[k] > rArray[k + 1]) {
-			outRArray[k/2] = rArray[k];
+		if (inArray[k] > inArray[k + 1]) {
+			outArray[j] = inArray[k];
 		}
 		else {
-			outRArray[i/2] = rArray[i+1];
+			outArray[j] = inArray[k + 1];
 		}
-		if (rArray[i + width] > outRArray[j]) {
-			outRArray[i/2] = rArray[i + width];
+		if (inArray[k + width] > outArray[j]) {
+			outArray[j] = inArray[k + width];
 		}
-		if (rArray[i + width + 1] > outRArray[i / 2]) {
-			outRArray[i/2] = rArray[i + width + 1];
+		if (inArray[k + width + 1] > outArray[j]) {
+			outArray[j] = inArray[k + width + 1];
 		}
-
-		// Pooling 
-		if (bArray[i] > bArray[i + 1]) {
-			outBArray[j] = bArray[i];
-		}
-		else {
-			outBArray[j] = bArray[i + 1];
-		}
-		if (bArray[i + width] > outBArray[j]) {
-			outBArray[j] = bArray[i + width];
-		}
-		if (bArray[i + width + 1] > outBArray[i / 2]) {
-			outBArray[j] = bArray[i + width + 1];
-		}
-
-		//max(rArray[i], rArray[i + 1], rArray[i + width], rArray[i + width + 1], outArray[i / 2]);
-		//outArray[(i / 2) + 1] = max({ gArray[i], gArray[i + 1], gArray[i + width], gArray[i + width + 1] });
-
-		// printf("%i\n", k);
 	}
-
-	//printf("%u\n", outMatrix[k]);
-
-	//}
-	//cout << inMatrix[i] << endl;
-	//cout << outMatrix[i]
 }
 
-//void max(unsigned char a, unsigned char b, unsigned char c, unsigned char d, unsigned char o) {
-//	if (a > b) {
-//		o = a;
-//	}
-//	else {
-//		o = b;
-//	}
-//	if (c > o) {
-//		o = c;
-//	}
-//	if (d > o) {
-//		o = d;
-//	}
-//}
+__global__ void pixelsSplitIntoQuarters(unsigned char* rgbaArray, unsigned char* rArray, unsigned char* gArray, unsigned char* bArray, unsigned char* aArray,
+										int sizeofQuarterPixels, int numOfThreads)
+{
+	for (int i = 0; i < (sizeofQuarterPixels) / numOfThreads; i++) {
+		int j = (threadIdx.x + numOfThreads * i) + (blockIdx.x * numOfThreads);
+		int k = j * 4;
+
+		rArray[j] = rgbaArray[k];
+		gArray[j] = rgbaArray[k + 1];
+		bArray[j] = rgbaArray[k + 2];
+		aArray[j] = rgbaArray[k + 3];
+	}	
+}
+
+__global__ void pixelsMerge(unsigned char* outrArray, unsigned char* outgArray, unsigned char* outbArray, unsigned char* outaArray, unsigned char* outfinalArray,
+							int sizeofQuarterPixels, int numOfThreads) {
+	for (int i = 0; i < ((sizeofQuarterPixels/4) / numOfThreads); i++) {
+		int j = (threadIdx.x + numOfThreads * i) + (blockIdx.x * numOfThreads);
+		int k = 4 * j;
+
+		outfinalArray[k] = outrArray[j];
+		outfinalArray[k + 1] = outgArray[j];
+		outfinalArray[k + 2] = outbArray[j];
+		outfinalArray[k + 3] = outaArray[j];
+	}
+}
 
 int main(int argc, char* argv[])
 {
@@ -122,14 +103,15 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	if (argv[1] != NULL /*&& argv[1] == cmd.c_str()*/) {
+	if (argv[1] != NULL && !strcmp(argv[1],"rectify")) {
+		cout << "Rectifing" << endl;
 		cudaError_t status = imageRectificationWithCuda(numOfThreads, inputImgName, outImgName);
 	}
 
-	//else if (argv[1] != NULL && argv[1] == "pool") {
-		//TODO::pool function
-	//}
-	//scout << *outputImgPtr << endl;
+	if (argv[1] != NULL && !strcmp(argv[1], "pool")) {
+		cout << "Pooling" << endl;
+		cudaError_t status = imagePoolingWithCuda(numOfThreads, inputImgName, outImgName);
+	}
 		
 	std::cout << "Name of Input Image File: " << inputImgName << std::endl;
 	std::cout << "Name of Output Image File: " << outImgName << std::endl;
@@ -145,9 +127,8 @@ int main(int argc, char* argv[])
 cudaError_t imageRectificationWithCuda(int numOfThreads, char* inputImageName, char* outputImageName)
 {
 	cudaError_t cudaStatus = cudaError_t::cudaErrorDeviceUninitilialized;
-
+	GpuTimer gpuTimer; // Struct for timing the GPU
 	unsigned char * inputImage = nullptr;
-
 	unsigned width, height = 0;
 
 	int error = lodepng_decode32_file(&inputImage, &width, &height, inputImageName);
@@ -178,10 +159,21 @@ cudaError_t imageRectificationWithCuda(int numOfThreads, char* inputImageName, c
 		dev_inMat[i] = inputImage[i];
 	}
 
+	//Code for running the timer
+	//timer = myCPUTimer()
+
 	//int numOfThreadsPerBlock = 1024;
 	// Launch kernel on the GPU with one thread for each element.
-	imgRectificationKernel <<<1, numOfThreads>> > (dev_inMat, sizeOfMat, numOfThreads);
-		
+	int numBlocks = ((numOfThreads + (MAX_NUMBER_THREADS - 1)) / MAX_NUMBER_THREADS);
+	int threadsPerBlock = ((numOfThreads + (numBlocks - 1)) / numBlocks);
+
+	/*************************************** Parrallel Part of Execution **********************************************/
+	gpuTimer.Start();
+	imgRectificationKernel <<<numBlocks, threadsPerBlock>> > (dev_inMat, sizeOfMat, threadsPerBlock);
+	gpuTimer.Stop();
+	/******************************************************************************************************************/
+	printf("-- Number of Threads: %d -- Execution Time (ms): %g \n", numOfThreads, gpuTimer.Elapsed());
+
 	// Check for any errors launching the kernel
 	cudaStatus = cudaGetLastError();
 	if (cudaStatus != cudaSuccess) {
@@ -215,9 +207,8 @@ Error:
 cudaError_t imagePoolingWithCuda(int numOfThreads, char* inputImageName, char* outputImageName)
 {
 	cudaError_t cudaStatus = cudaError_t::cudaErrorDeviceUninitilialized;
-
+	GpuTimer gpuTimer; // Struct for timing the GPU
 	unsigned char* inputImage = nullptr;
-
 	unsigned width, height = 0;
 
 	int error = lodepng_decode32_file(&inputImage, &width, &height, inputImageName);
@@ -229,13 +220,23 @@ cudaError_t imagePoolingWithCuda(int numOfThreads, char* inputImageName, char* o
 
 	int sizeOfArray = width * height * 4;
 
-	unsigned char *dev_RArray, *dev_GArray, *dev_BArray, *dev_AArray, *dev_outRArray, *dev_outGArray, *dev_outBArray, *dev_outAArray, *dev_outArray;
+	unsigned char *dev_RGBAArray, *dev_RArray, *dev_GArray, *dev_BArray, *dev_AArray, *dev_outRArray, *dev_outGArray, *dev_outBArray, *dev_outAArray, *dev_outArray;
 
 	// Choose which GPU to run on, change this on a multi-GPU system.
 	cudaStatus = cudaSetDevice(0);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
 		goto Error;
+	}
+
+	cudaStatus = cudaMallocManaged((void**)& dev_RGBAArray, sizeOfArray * sizeof(unsigned char));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	for (int i = 0; i < sizeOfArray; i++) {
+		dev_RGBAArray[i] = inputImage[i];
 	}
 
 	// To make our life easier, we're going to split the RGBA values into separate arrays - let's start by mallocing them
@@ -293,25 +294,27 @@ cudaError_t imagePoolingWithCuda(int numOfThreads, char* inputImageName, char* o
 		goto Error;
 	}
 
-	// Filter out the RBG channels into seperate arrays
-	int filterIndex = 0;
-	for (int i = 0; i < sizeOfArray; i++) {
-		switch (i % 4)
-		{
-			case (0): dev_RArray[filterIndex] = inputImage[i];
-			case (1): dev_GArray[filterIndex] = inputImage[i];
-			case (2): dev_BArray[filterIndex] = inputImage[i];
-				// We are simply going to ignore the alpha index, and increment the filter index
-			case (3): {
-				dev_AArray[filterIndex] = inputImage[i];
-				filterIndex++;
-			}
-		}
-	}
+	int numBlocks = ((numOfThreads + (MAX_NUMBER_THREADS - 1)) / MAX_NUMBER_THREADS);
+	int threadsPerBlock = ((numOfThreads + (numBlocks - 1)) / numBlocks);
+
+	/*************************************** Parrallel Part of Execution **********************************************/
+	gpuTimer.Start();
+	pixelsSplitIntoQuarters << <numBlocks, threadsPerBlock >> > (dev_RGBAArray, dev_RArray, dev_GArray, dev_BArray, dev_AArray, sizeOfArray/4, threadsPerBlock);
 
 	//int numOfThreadsPerBlock = 1024;
 	// Launch kernel on the GPU with one thread for each element.
-	imgPoolingKernel << <1, numOfThreads >> > (dev_RArray, dev_GArray, dev_BArray, dev_AArray, dev_outRArray, dev_outGArray, dev_outBArray, dev_outAArray, dev_outArray, sizeOfArray, numOfThreads, width);
+	arrayMaxPerQuarterPixelKernel <<<numBlocks, threadsPerBlock >> > (dev_RArray, dev_outRArray, sizeOfArray/4, threadsPerBlock, width);
+
+	arrayMaxPerQuarterPixelKernel <<<numBlocks, threadsPerBlock >> > (dev_GArray, dev_outGArray, sizeOfArray/4, threadsPerBlock, width);
+
+	arrayMaxPerQuarterPixelKernel <<<numBlocks, threadsPerBlock >> > (dev_BArray, dev_outBArray, sizeOfArray/4, threadsPerBlock, width);
+
+	arrayMaxPerQuarterPixelKernel <<<numBlocks, threadsPerBlock >> > (dev_AArray, dev_outAArray, sizeOfArray/4, threadsPerBlock, width);
+
+	pixelsMerge <<<numBlocks, threadsPerBlock >> > (dev_outRArray, dev_outGArray, dev_outBArray, dev_outAArray, dev_outArray, sizeOfArray/4, threadsPerBlock);
+	gpuTimer.Stop();
+	/*****************************************************************************************************************/
+	printf("-- Number of Threads: %d -- Execution Time (ms): %g \n", numOfThreads, gpuTimer.Elapsed());
 
 	// Check for any errors launching the kernel
 	cudaStatus = cudaGetLastError();
@@ -338,10 +341,17 @@ cudaError_t imagePoolingWithCuda(int numOfThreads, char* inputImageName, char* o
 	free(inputImage);
 
 Error:
-	cudaFree(dev_outArray);
+	// BE FREE MY LOVLIES
+	cudaFree(dev_RGBAArray);
 	cudaFree(dev_RArray);
 	cudaFree(dev_GArray);
 	cudaFree(dev_BArray);
+	cudaFree(dev_AArray);
+	cudaFree(dev_outRArray);
+	cudaFree(dev_outGArray);
+	cudaFree(dev_outBArray);
+	cudaFree(dev_outAArray);
+	cudaFree(dev_outArray);
 
 	return cudaStatus;
 }
